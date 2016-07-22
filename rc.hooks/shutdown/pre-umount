@@ -1,0 +1,6 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+
+#
+# This hook is sourced before the 1st stage umount sequence.
+#

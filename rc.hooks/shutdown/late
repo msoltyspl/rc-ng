@@ -1,0 +1,18 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+
+#
+# This hook is sourced at the end of halt/reboot runlevels, right before
+# pivot/halt/reboot/kexec.
+#
+# Meant for some late custom configuration - good place for ups daemons' stuff
+# and such.
+#
+# $TMPDIR is guaranteed to exist and be writable at this point
+#
+
+
+# if you performed some special magic above, requiring some of the filesystems
+# mounted, you might want to redo forced detach sequence quietly (forced ==
+# ignoring UMOUNT_NO)
+#rc_detach_all + &>/dev/null

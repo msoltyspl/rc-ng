@@ -1,0 +1,29 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+
+#
+# This hook is sourced at the begining of sysinit sequence, right after special
+# mounts and module loading.
+#
+
+# it's (usually) good to have lo interface brought up early
+
+if [[ -d /sys/class/net/lo ]]; then
+	echo "bringing up loopback interface"
+	ip addr add 127.0.0.1/8 dev lo broadcast + scope host
+	ip link set lo up
+fi
+
+# this should be done as early as possible, see mdmon(8)
+# not necessary with decent initramfs, in practice though ...
+
+if command -v mdmon &>/dev/null; then
+	mdmon --takeover --all
+	pidof -s mdmon &>/dev/null && echo "mdmon is active"
+fi
+
+# umount intramfs's submounts, if any
+while read _mnt; do
+	umount -l "$_mnt"
+done < <(mntpts '^(/dev/(.run|.initramfs)/|/run/)')
+rm -rf /dev/{.run,.initramfs}

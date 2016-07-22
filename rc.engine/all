@@ -1,0 +1,361 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet fo=crq ft=sh
+#
+# Common functions used across different runlevels
+#
+
+type -p ismnt || . /etc/rc.engine/lib
+
+# source config + sanitize environment
+function rc_init() {
+	set -f; . /etc/rc.conf; set +f
+	__rc_sanitize_vars 
+	export PATH=/sbin:/bin:/usr/sbin:/usr/bin HOME=/root
+	unset  "${!LC_@}" LANG
+	umask 0022
+	stty onlcr
+	# verify /run presence, adjust accordingly
+	if [[ -d /run ]]; then
+		RCDIR=/run/rcdir
+	else
+		RCDIR=/dev/.rcdir
+	fi
+	# normally a sysinit essential, but be sure
+	if [[ $PREVLEVEL != N ]]; then
+		mkdir -p -m 0755 "$RCDIR"
+	fi
+}
+
+function __rc_sanitize_vars() {
+	shopt -q -s nocasematch
+
+	# sanitize all rc.conf variables - easier to have it done in one place
+
+	# name, def, min, max
+	function nbr() {
+		[[ ${!1} =~ ^[-+]?[0-9]+$ ]] || eval $1=\$2
+		(( ${!1} < $3 )) && eval $1=\$3
+		(( ${!1} > $4 )) && eval $1=\$4
+	}
+	# name, regex, match, alternative
+	function tog() {
+		[[ ${!1} =~ ^$2$ ]] && eval $1=\$3 || eval $1=\$4
+	}
+	# name, def
+	function def() {
+		[[ -z ${!1} ]] && eval $1=\$2
+	}
+
+	def SYSNAME System
+
+	#def FONT default8x16
+	def KEYMAP defkeymap
+	tog CONMODE 'asc(ii)?' ascii utf8
+	nbr CONCNT 6 1 63
+
+	tog FUSECTL yes yes no
+	tog CONFIGFS yes yes no
+	tog DEBUGFS yes yes no
+
+	tog KMSG_FMT old old new
+	nbr KMSG_LEV 5 0 7
+	nbr KMSG_FCL 3 0 23
+	def KMSG_TAG "$SYSNAME"
+	def LOGGER_DEF daemon.info
+
+	tog HWCLKMODE 'local(time)?' localtime utc
+
+	def TIMEZONE UTC
+	def HOSTNAME host
+	nbr TERM_BLANK 15 0 9999
+	nbr TERM_POWER  5 0 9999
+
+	nbr SRV_TIMEOUT  10 1 120
+	#tog FSCK_MOUNTED no no yes
+
+	nbr DETACH_CNT 3 1 16
+
+	shopt -q -u nocasematch
+}
+
+# source hook
+function rc_hook() {
+	local _path=${HOOKDIR:-/etc/rc.hooks}
+	if [[ -r "$_path/$1" ]]; then
+		. "$_path/$1"
+	else
+		echo "hook '$1' not found !"
+	fi
+}
+
+# customized umount -a, skipping certain mountpoints
+# $1 - if not null, ignore UMOUNT_NO
+function __rc_umount_a() {
+	local _mnts _keep
+
+	if [[ -n $1 ]]; then
+		_keep=("${UMOUNT_NO[@]}")
+	fi
+	_keep+=('/' '/dev.*' '/sys.*' '/proc.*' '/run.*')
+
+	while read _mnt; do
+		for _tst in "${_keep[@]}"; do
+			[[ $_mnt =~ ^$_tst$ ]] && continue 2
+		done
+		umount "$_mnt" 2>/dev/null
+	done < <(mntpts)
+}
+
+# customized remount
+function __rc_remount_ro() {
+	local _mnts _keep
+
+	_keep=('/' '/dev.*' '/sys.*' '/proc.*' '/run.*')
+
+	while read _mnt; do
+		for _tst in "${_keep[@]}"; do
+			[[ $_mnt =~ ^$_tst$ ]] && continue 2
+		done
+		echo "$_mnt"
+		mount -o remount,ro "$_mnt" 2>/dev/null
+	done < <(mntpts)
+	echo "/"
+	mount -n -o remount,ro / 2>/dev/null
+}
+
+# looped detach sequence, in order: __rc_umount_a, swaps, loopbacks, dm, md
+# $1 - if not null, ignore UMOUNT_NO
+function rc_detach_all() {
+	local _x
+	local -a _str
+	local -i _cnt _dsw=1 _dlo=1 _ddm=1 _dmd=1
+
+	command -v swapoff &>/dev/null || _dsw=0
+	command -v losetup &>/dev/null || _dlo=0
+	command -v dmsetup &>/dev/null || _ddm=0
+	command -v mdadm &>/dev/null   || _dmd=0
+
+	echo "detach sequence ..."
+	while (( _cnt++ < $DETACH_CNT && _dsw + _dlo + _ddm + _dmd )); do
+		echo "  detach pass $_cnt / $DETACH_CNT ..."
+		# mounts
+		__rc_umount_a "$1"
+		# swaps
+		if (( $_dsw )); then
+			swapoff -a 2>/dev/null
+			mapfile -s 1 -n 1 _str </proc/swaps
+			(( ! ( _dsw=${#_str[@]} ) )) && echo "    all swap devices detached"
+		fi
+		# loopbacks
+		if (( $_dlo )); then
+			while read _x; do
+				losetup -d "${_x%%:*}" 2>/dev/null
+			done  < <(losetup -a 2>/dev/null)
+			mapfile -n 1 _str < <(losetup -a 2>/dev/null)
+			(( ! ( _dlo=${#_str[@]}) )) && echo "    all loopback devices detached"
+		fi
+		# mapper (everything - lvm, crypts, etc.)
+		if (( $_ddm )); then
+			#dmsetup remove_all --noudevrules --noudevsync 2>/dev/null
+			dmsetup remove_all 2>/dev/null
+			mapfile -n 1 _str < <(dmsetup info -c --noheadings -o name 2>/dev/null)
+			(( ! ( _ddm=${#_str[@]} ) )) && echo "    all mapper devices detached"
+		fi
+		# mdraid
+		if (( $_dmd )); then
+			mdadm -Ssq 2>/dev/null
+			mapfile -n 1 _str < <(mdadm -Dsq 2>/dev/null)
+			(( ! ( _dmd=${#_str[@]} ) )) && echo "    all mdraid devices detached"
+		fi
+	done
+	echo "  + detach passes: done"
+	(( $_dsw )) && { echo "  some swap devices left active:"; { read _x; shcat; } </proc/swaps | shcatp '    '; }
+	(( $_dlo )) && { echo "  some loopback devices left active:"; losetup -a | shcatp '    '; }
+	(( $_ddm )) && { echo "  some mapper devices left active:"; dmsetup info -c --noheadings -o name | shcatp '    '; }
+	(( $_dmd )) && { echo "  some mdraid devices and/or containers left active:"; mdadm -Ds | shcatp '    '; }
+	echo "  remounting remaining filesystems (ro):"
+	__rc_remount_ro | shcatp '    '
+	if (( $_dmd )); then
+		while read -a _str; do
+			mdadm --wait-clean --readonly "${_str[1]}"
+		done < <(mdadm -Ds)
+	fi
+	echo "+ detach sequence: done"
+}
+
+# some things must not be killed (e.g. mdmon), some other it's better
+# if they are not killed (e.g. udev); killall5 is nice, but kinda old
+# for our needs
+# earlier versions used right-outer join of "keep" pids X "all" pids (join, pgrep, sort)
+# but apparently ps is enough
+function rc_kill_processes() {
+	local _rem _cmds _x _ps _ps2 _f=$RCDIR/ps.kill.list
+	local -i _i
+
+	_cmds="udevd mdmon init tkld"
+	for _x in "${IMMORTALS[@]}"; do _cmds+=" $_x"; done
+
+	# we use direct ps call w/o any trickery, to avoid deep process spawns
+	_ps='ps -o pid --no-headers --pid "1 2 $$ $BASHPID" --ppid "2 $$ $BASHPID" -C "$_cmds" -N'
+	eval $_ps >|$_f; mapfile -t _rem <$_f; rm -f $_f
+	(( ${#_rem[@]} )) || return
+
+	udevadm control --stop-exec-queue &>/dev/null
+
+	# notice about offending processes
+	#_ps2="ps -o pid,args --no-headers --cols 80 --pid '$(compgen -W '${_rem[*]}')'"
+	echo "about to get rid of:"
+	eval 'ps -o pid,args --no-headers --cols 80 --pid "${_rem[*]// /}"'
+
+
+	echo "sending SIGTERM to leftover processes"
+	kill -15 -- ${_rem[*]} &>/dev/null
+
+	_i=0; while (( _i++ < ${KILLDELAY:-5} )); do
+		sleep 1
+		eval $_ps >|$_f; mapfile -t _rem <$_f
+		(( ${#_rem[@]} )) || break
+	done
+	rm -f $_f
+	if (( ${#_rem[@]} )); then
+		echo "sending SIGKILL to leftover processes"
+		kill -9 -- ${_rem[*]} &>/dev/null
+	else
+		echo "SIGKILL not needed"
+	fi
+
+	udevadm control --start-exec-queue &>/dev/null
+
+	echo "+ killing leftover processes: done"
+}
+
+# $1 - service
+# $2 - start|stop
+# $3 - quiet|""
+# $4 - if $3 == quiet: file with failed jobs
+function __rc_spawner() {
+	local _pid _pipe _log
+	_log="$(mktemp --tmpdir=$RCDIR)"
+	_pipe="$(mktemp -u --tmpdir=$RCDIR)"
+	mkfifo "$_pipe"
+
+	if [[ $3 = quiet ]]; then
+		exec &>/dev/null
+	fi
+	# force separate process group
+	set -m
+	(
+		"/etc/rc.d/$1" $2 &>$_log
+		#"/etc/rc.d/$1" $2 |& kl_tag "$1"
+		# writer must block
+		echo "$?" >"$_pipe"
+	) &
+	set +m
+	_pid=$!
+	disown %%
+
+	# see note in tkld about EINTR in pre-4.2 bashes
+	if read -t $SRV_TIMEOUT _rep 0<>"$_pipe" &>/dev/null; then
+		(( $_rep )) && echo -n "[ERR]"
+	else
+		#echo -ne "\n  the start of service '$1' was unsuccessful, killing stale process group\n   "
+		echo -n "[KILL]"
+		# kill it with fire ...
+		kill -9 -- -$_pid &>/dev/null
+		echo "ERROR - service '$1' startup failure, killed what we could" >$_log
+		[[ -n $4 ]] && echo "$1" >>"$4"
+		# note: there's a minuscule chance for race condition(s) here, so
+		# use reasonable SRV_TIMEOUT (not 1 second ...)
+	fi
+	logger -p $LOGGER_DEF -t "$1" -f "$_log"
+
+	rm -f "$_pipe" "$_log"
+}
+
+# not how we handle service starting - we don't naively wait for the success
+# as we might end waiting forever ;)
+function rc_srv_start() {
+	local _x _f _pre _srv _pat _bkgfail
+
+	_bkgfail="$(mktemp --tmpdir=$RCDIR)"
+	_pat='^([@!]{0,2})([^@!]+)$'
+
+	echo -en "starting services ...\n   "
+
+	(:
+	for _x in "$@"; do
+		# skip invalid spec
+		if [[ ! "${_x}" =~ $_pat ]]; then
+			echo " '${_x}'[!SPEC]"
+			continue
+		fi
+		_pre=${BASH_REMATCH[1]}
+		_srv=${BASH_REMATCH[2]}
+		echo -n " $_srv"
+		if [[ ! -x "/etc/rc.d/$_srv" ]]; then
+			echo -n "[!EXE]"
+			continue
+		fi
+		if [[ ${_pre#*\!*} != $_pre ]]; then
+			echo -n "[SKIP]"
+			continue
+		fi
+		if [[ ${_pre#*\@*} != $_pre ]]; then
+			echo -n "[BKG]"
+			#"/etc/rc.d/$_srv" start &>"$RCDIR/rc.$$.${_srv}" &
+			#"/etc/rc.d/$_srv" start |& kl_tag "$_srv"
+			__rc_spawner "$_srv" start quiet "$_bkgfail" &
+			continue
+		fi
+		__rc_spawner "$_srv" start
+	done
+	echo
+
+	# wait for all our background spawns
+	# this is safe, as __rc_spawner will kill offending process
+	# groups
+	wait )
+
+	mapfile -t _f <"$_bkgfail"
+	if (( ${#_f[@]} )); then
+		echo "  some background services timed out and their process groups were killed:"
+		for _x in "${_f[@]}"; do
+			echo "    $_x"
+		done
+		echo "  note: some processes that escaped process group might be active"
+	fi
+
+	rm -f "$_bkgfail"
+	echo "+ starting services: done"
+}
+
+function rc_srv_stop() {
+	local _i _pre _srv _pat
+
+	_pat='^([@!]{0,2})([^@!]+)$'
+
+	# go through the arguments backwards, no async here
+	# also no skipping
+	echo -en "stopping services ...\n   "
+	for (( _i = $#; _i > 0; _i--)); do
+		if [[ ! "${!_i}" =~ $_pat ]]; then
+			echo " '${!_i}'[!SPEC]"
+			continue
+		fi
+		_pre=${BASH_REMATCH[1]}
+		_srv=${BASH_REMATCH[2]}
+		echo -n " $_srv"
+		if [[ ! -x "/etc/rc.d/$_srv" ]]; then
+			echo -n "[!EXE]"
+			continue
+		fi
+		if [[ ${_pre#*\!*} != $_pre ]]; then
+			echo -n "[SKIP]"
+			continue
+		fi
+		__rc_spawner "$_srv" stop
+	done
+	echo
+
+	echo "+ stopping services: done"
+}

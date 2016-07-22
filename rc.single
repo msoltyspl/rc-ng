@@ -1,0 +1,26 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+# /etc/rc.single: single-user startup script
+
+. /etc/rc.engine/single
+rc_init
+
+echo "$SYSNAME is entering single-user mode, please wait."
+
+rc_hook single/early
+
+if [[ $PREVLEVEL == 2 ]]; then
+	rc_srv_stop $SYSLOG "${SERVICES[@]}"
+fi
+start_kmsg_log
+if [[ $PREVLEVEL != N ]]; then
+	rc_kill_processes
+fi
+
+rc_hook single/late
+
+[[ $RUNLEVEL == 1 ]] && echo "replacing runlevel: 1 -> S"
+stop_kmsg_log
+
+telinit -t1 S

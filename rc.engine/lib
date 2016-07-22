@@ -1,0 +1,207 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+
+# the point behind those helpers is tofold:
+# - less dependencies
+# - [much] faster than spawning external tools
+
+#ismnt2() {
+#	local _line _arg=$1
+#	while read _line; do
+#		set -- $_line
+#		[[ $7 = - ]] && set -- "${@:1:6}" none '-' ${@:8}
+#
+#		# skip inaccesible rootfs mounts, but exclude real /
+#		[[ $1 = 1 || ( $2 = 1 && $5 != / ) ]] && continue
+#
+#		[[ $_arg = $5 ]] && return 0
+#	done </proc/self/mountinfo
+#	return 1
+#}
+#eval _arg=\$\'$1\'
+#eval _tst=\$\'$5\'
+#[[ $_arg = $_tst ]] && return 0
+# true if we're mounted, but skip rootfs undermounts
+# mountinfo won't output them, which is what we want
+# $1 - mountpoint
+# $2 - include pID=1 mounts (any string)
+ismnt() {
+	local _line _arg="${1// /\040}" _u=$2
+	while read -r _line; do
+		set -- $_line
+		[[ -z $_u && ( $1 = 1 || ( $2 = 1 && $5 != / )) ]] && continue
+		# right hand quote is bug avoidance
+		[[ $_arg = "$5" ]] && return 0
+	done </proc/self/mountinfo
+	return 1
+}
+
+# output reversed mountpoints
+# $1 - extended regex to match against
+# $2 - include PID=1 undermounts (any string)
+mntpts() {
+	local _line _all _arg=$1 _u=$2
+	while read -r _line; do
+		set -- $_line
+		[[ -z $_u && ( $1 = 1 || ( $2 = 1 && $5 != / )) ]] && continue
+		[[ $5 =~ $_arg ]] || continue
+		_all="$5"$'\n'"${_all}"
+	done </proc/self/mountinfo
+	echo -n "${_all}"
+}
+
+shtac() {
+	local _i
+	mapfile; _i="${#MAPFILE[*]}"
+	while ((--_i >= 0)); do
+		echo -n "${MAPFILE[$_i]}"
+	done
+}
+
+shcat() {
+	mapfile
+	IFS='' eval echo -n '"${MAPFILE[*]}"'
+}
+
+# as above, with $1 as a prefix
+shcatp() {
+	mapfile
+	IFS='' eval echo -n '"${MAPFILE[*]/#/$1}"'
+}
+
+shegrep() {
+	local _line _one _ret=1
+	if [[ $1 = -q && $# -ge 2 ]]; then
+		_one=y
+		shift
+	fi
+	while IFS='' read -r _line; do
+		if [[ "$_line" =~ $1 ]]; then
+			[[ $_one ]] && return 0
+			echo "$_line"
+			_ret=0
+		fi
+	done
+	return $_ret
+}
+
+settmp() {
+	# [in]sanity check
+	[[ -z $RCDIR || -n $TMPDIR ]] && return 1
+	mkdir -p -m 1777 "$RCDIR/tmp"
+	export TMPDIR=$RCDIR/tmp
+}
+
+unsettmp() {
+	# [in]sanity check
+	[[ -z $RCDIR || $RCDIR/tmp != $TMPDIR ]] && return 1
+	rm -rf "$RCDIR/tmp"
+	unset TMPDIR
+}
+
+function start_kmsg_log() {
+	local _pipe=$RCDIR/logKpipe _done=$RCDIR/logDpipe _lev
+	#shouldn't happen, but ...
+	[[ ! -p $_pipe && ! -p $_done ]] && command -v mkfifo &>/dev/null || return
+	rclib_logpipe=$_pipe
+	rclib_logdone=$_done
+	rclib_logtag=sjflqie753qo4875bkshf923875203q
+
+	read rclib_logprv </proc/sys/kernel/printk
+	_lev=${rclib_logprv:0:1}
+	# note - this might conflict with level set by normal syslog daemon,
+	# and if one was started during the kmsg logger activity, its kmsg
+	# related setting will be reset to $rclib_logprv at stop
+	if (( $_lev <= $KMSG_LEV )); then
+		# make sure our output goes to console
+		echo ${rclib_logprv/#[0-9]/$((KMSG_LEV+1))} >|/proc/sys/kernel/printk
+	fi
+
+	eval mkfifo \$rclib_log{pipe,done}
+	eval /etc/rc.engine/tkld \
+		\$KMSG_{FMT,FCL,LEV,TAG} \$rclib_log{pipe,done,tag} \&
+	rclib_logpid=$!
+	# disown the logger so we don't accidentally wait for it
+	disown %%
+
+	# redirect output
+	exec 1<>$rclib_logpipe 2>&1
+}
+
+function stop_kmsg_log() {
+	local _ok
+
+	#shouldn't happen, but ...
+	[[ ! -p $rclib_logpipe || ! -p $rclib_logdone ]] && return
+
+	# this read sequence prefers 4.2+, due to bug present in all earlier
+	# bash versions, when read/echo/printf/etc. could be EINTRed by SIGCHLD
+	# (of some internal bash stuff); nothing serious, but keep in mind if
+	# you use older versions of bash
+	echo "$rclib_logtag"
+	exec &>/dev/null
+	read -t 10 _ok <>$rclib_logdone || {
+		echo "killing tkld" &>/dev/console
+		kill -9 $rclib_logpid
+	}
+
+	exec &>/dev/console
+	rm -f $rclib_logpipe $rclib_logdone
+	echo ${rclib_logprv} >|/proc/sys/kernel/printk
+	unset "${!rclib_log@}"
+}
+
+function emerg_shell() {
+	[[ -n "$1" ]] && echo "$1" &>/dev/console
+	if [[ -c /dev/tty1 ]] && command -v setsid &>/dev/null; then
+		# get us a normal job control :)
+		setsid sulogin -p </dev/tty1 &>/dev/tty1
+	else
+		sulogin -p </dev/console &>/dev/console
+	fi
+}
+
+# list all pids that are listed in pids or matche a name, and can be found in
+# ancestry path
+# $1 - space separated pids
+# $2 - space separated names
+#
+# pretty slow ...  we don't use it at the moment - set -m/+m does what we need
+# in practice
+function pid_ancestry() {
+	local _x _curr=' ' _prev
+	local -a _info _name _pid _ppid
+	local -i _cnt
+
+	for _x in /proc/[0-9]*/status; do
+		mapfile -n 5 _info <$_x
+		_name+=(${_info[0]#*$'\t'})
+		 _pid+=(${_info[3]#*$'\t'})
+		_ppid+=(${_info[4]#*$'\t'})
+	done
+	_cnt=${#_pid[@]}
+	#echo cnt: $_cnt >&2
+
+	while true; do
+		for ((_i=0;_i<_cnt;_i++)); do
+			[[ ${_curr} != ${_curr#* ${_pid[_i]} *} ]] && continue
+			# check pids / parent pids
+			for _x in $1 $_prev; do
+				if [[ $_x = ${_pid[_i]} || $_x = ${_ppid[_i]} ]]; then
+					_curr+="${_pid[_i]} "
+				fi
+			done
+			# check names
+			for _x in $2; do
+				if [[ $_x = ${_name[_i]} ]]; then
+					_curr+="${_pid[_i]} "
+				fi
+			done
+		done
+		[[ $_curr = $_prev ]] && break
+		_prev="$_curr"
+		#echo loop! >&2
+	done
+	echo $_curr
+}

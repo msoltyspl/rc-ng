@@ -1,0 +1,50 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+# /etc/rc.sysinit: system boot script
+
+. /etc/rc.engine/sysinit
+
+# Common init (path, home, sanitization of options, etc.); for all runlevels
+rc_init
+# Early essential stuff (clock tz, /dev + provision, special mounts, rcdir)
+si_essential
+# temporary writable tmp
+settmp
+# kmsg logger, all output goes to it, until stop_kmsg_log()
+start_kmsg_log
+echo "$SYSNAME is coming up, please wait."
+# load rc.conf specified modules, if any
+si_kmods
+# stuff you might want done early - e.g. loopback interface, mdmon takeover,
+# initramfs cleanup, etc.
+rc_hook sysinit/early
+
+rc_hook sysinit/pre-trigger1
+si_udev
+rc_hook sysinit/udev-runner1
+
+if ! si_fsck; then
+	rc_detach_all +
+	reboot -f -d -i
+	exit 0
+fi
+
+rc_hook sysinit/pre-mount
+si_mount_local
+unsettmp
+rc_hook sysinit/post-mount
+
+if [[ $rcsi_udev_retrigger = yes ]]; then
+	rc_hook sysinit/pre-trigger2
+	si_udev_retry
+	rc_hook sysinit/udev-runner2
+fi
+
+si_std
+
+rc_hook sysinit/late
+
+echo -e "$SYSNAME init completed\nboot log is available at /var/log/boot"
+dmesg >|/var/log/boot
+stop_kmsg_log

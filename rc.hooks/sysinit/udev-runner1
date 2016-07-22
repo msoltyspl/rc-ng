@@ -1,0 +1,29 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+
+# This hook is sourced immediately after udev trigger without waiting for
+# udev's settle.
+#
+# Do the stuff such as mdadm, lvm, crypt, etc. here; for more complex setups
+# you might need some loop processing, etc.
+#
+
+udevadm settle
+
+# mdadm v3.2.x
+#
+# modern mdadm uses udev rules to assemble raid arrays/containers; please use
+# AUTO= stanza in mdadm.conf to inhibit assembly of non-ARRAY defined
+# arrays/containers. See mdadm.conf(5) for details.
+
+# lvm with udev-sync and udev-rules
+#
+# create device-mapper device nodes and scan for LVM volume groups; don't use
+# mknodes here, it will conflict with udev rules
+if command -v lvm &>/dev/null; then
+	export LVM_SUPPRESS_LOCKING_FAILURE_MESSAGES=1
+	lvm vgscan --ignorelockingfailure
+	lvm vgchange -ay --sysinit
+	# udevadm settle not needed due to proper udev sync
+	unset LVM_SUPPRESS_LOCKING_FAILURE_MESSAGES
+fi

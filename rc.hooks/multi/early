@@ -1,0 +1,24 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+
+#
+# This hook is sourced at the begining of multi user configuration.
+# This is equivalent of rc.fix from older rc scripts
+#
+
+# X11 font-related checks / fixups
+function font_fix() {
+	local _i
+	while read _i; do
+		if [[ ! -f "$_i/fonts.dir" ]]; then
+			mkfontdir "$_i" &>/dev/null
+			mkfontscale "$_i" &>/dev/null
+		fi
+	done < <(compgen -G "/usr/share/fonts/X11/*")
+
+	if ! compgen -G '/var/cache/fontconfig/*' &>/dev/null; then
+		fc-cache &>/dev/null
+	fi
+}
+
+font_fix

@@ -1,0 +1,39 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+# /etc/rc.shutdown: system shutdown script
+
+. /etc/rc.engine/shutdown
+rc_init
+
+echo "$SYSNAME is coming down, please wait."
+
+rc_hook shutdown/early
+
+if [[ $PREVLEVEL = 2 ]]; then
+	rc_srv_stop $SYSLOG "${SERVICES[@]}"
+fi
+
+start_kmsg_log
+
+rc_kill_processes
+sd_std
+settmp
+rc_detach_all
+rc_hook shutdown/late
+unsettmp
+
+# TODO
+# detection if we can pivot back to /run
+# and perform full umount/detach
+
+echo "about to halt/reboot/kexec"
+stop_kmsg_log
+
+if [[ "$RUNLEVEL" = 0 ]]; then
+	poweroff -d -f -i
+else
+	command -v kexec &>/dev/null && kexec -e
+	# will silently fail, if no kernel loaded
+	reboot -d -f -i
+fi

@@ -1,0 +1,15 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+# /etc/rc.multi: multi-user startup script
+
+. /etc/rc.engine/multi
+rc_init
+
+echo "$SYSNAME is entering multi-user mode, please wait."
+
+rc_hook multi/early
+
+rc_srv_start $SYSLOG "${SERVICES[@]}"
+
+rc_hook multi/late

@@ -1,0 +1,7 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+
+#
+# This hook is sourced at the end of mutli user configuration.
+# Equivalent of rc.local from old rc scripts
+#

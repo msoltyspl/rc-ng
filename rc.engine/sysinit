@@ -1,0 +1,350 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+
+type -p rc_init || . /etc/rc.engine/all
+
+function si_essential() {
+	local _fstab _x
+
+	# $1 mount point to check against pre-read fstab
+	function infstab() {
+		local _i
+		for ((_i = 0; _i < ${#_fstab[@]} ; i++)); do
+#			[[ -z ${_fstab[_i]###*} ]] && continue
+			[[ ${_fstab[_i]} =~ ^[^#][^[:blank:]]*[[:blank:]]+([^[:blank:]]+) ]] || continue
+			[[ ${BASH_REMATCH[1]} = "${1// /\040}" ]] && return 0
+		done
+		return 1
+	}
+	# $1 comma separated fs to try in turn
+	# $2 opts
+	# $3 dir
+	function vmnt() {
+		local _fs _opt _dev _x
+
+		[[ -d $3 ]] || return
+		# comma separated list is a bit paranoid, we should just assume
+		# that whatever needed is in kernel, API stuff in particular
+		IFS=, eval _fs='( $1 )'
+		for _x in "${_fs[@]}" ""; do
+			shegrep -q "[[:blank:]]$_x$" </proc/filesystems && break
+		done
+		[[ -z $_x ]] && return
+		# /paranoid
+
+		# use options and "device" only if not in fstab
+		infstab "$3" || { _opt=$2; _dev=$_x; }
+
+		if ismnt "$3"; then
+			_opt="-o remount${_opt:+,$_opt}"
+			unset _fs
+		else
+			_opt="${_opt:+-o $_opt}"
+			_fs="-t $_x"
+		fi
+
+		mount $_fs $_opt $_dev "$3"
+	}
+
+	# set proper time (this does not access rtc !)
+	# this requires /etc/localtime to make sense (file or symlink+/usr
+	# mounted)
+	if [[ $HWCLKMODE = localtime && -r /etc/localtime ]]; then
+		hwclock --localtime --systz --noadjfile
+	fi
+
+	# we assure /proc mount, then vmnt handles it (fstab opts and crap)
+	# hard to live without proc :) and we have stuff depending on it
+	[[ -d /proc/self ]] || mount -t proc -o "nosuid,noexec,nodev" proc /proc
+
+	# preread fstab for custom options
+	mapfile -t _fstab < <(shopt -s nullglob; for _x in /etc/fsta[b] /etc/fstab.d/*; do echo "$(< "$_x")"; done)
+
+	# early mounts
+	# - might be handed over from initramfs, might be not
+	# - might have sane mount options, might have not
+	# - might be in fstab, might be not
+	vmnt proc           "nosuid,noexec,nodev"             /proc
+	vmnt sysfs          "nosuid,noexec,nodev"             /sys
+	vmnt devtmpfs,tmpfs "mode=0755,nosuid"                /dev
+	mkdir -p -m 0755    /dev/{pts,shm}
+	vmnt tmpfs          "mode=1777,nosuid,nodev"          /dev/shm
+	vmnt devpts         "mode=0620,gid=tty,nosuid,noexec" /dev/pts
+	vmnt tmpfs          "mode=0755,nosuid,nodev,exec"     /run
+	vmnt tmpfs          "mode=0755,nosuid,nodev,exec"     /sys/fs/cgroup
+
+	# non essential mounts with rc.conf knobs; we should add a few more =)
+
+	if [[ $FUSECTL = yes ]]; then
+		modprobe -bq fuse
+		vmnt fusectl  "mode=0755,nosuid,noexec,nodev" /sys/fs/fuse/connections
+	fi
+	if [[ $CONFIGFS = yes ]]; then
+		modprobe -bq configfs
+		vmnt configfs "mode=0755,nosuid,noexec,nodev" /config
+	fi
+	if [[ $DEBUGFS = yes ]]; then
+		vmnt debugfs  "mode=0755,nosuid,noexec,nodev" /sys/kernel/debug
+	fi
+
+	# udev provision
+	__si_udev_provision
+
+	# rc scripts related stuff RCDIR
+	mkdir -p -m 0755 "$RCDIR"
+}
+
+function __si_udev_provision() {
+	# not really necessary with modern udevd, but we might be needing
+	# a few things before udev has a chance to run and fix things;
+	# and there're hooks before trigger too ...
+	# normally it would be handed over from initramfs, and everything but
+	# symlinks would be present on devtmpfs
+
+	[[ -c /dev/zero ]]    || mknod -m 0666 /dev/zero c 1 5
+	[[ -c /dev/null ]]    || mknod -m 0666 /dev/null c 1 3
+	[[ -c /dev/ptmx ]]    || mknod -m 0666 /dev/ptmx c 5 2
+	[[ -c /dev/console ]] || mknod -m 0600 /dev/console c 5 1
+	[[ -c /dev/tty1 ]]    || mknod -m 0600 /dev/tty1 c 4 1
+	[[ -c /dev/kmsg ]]    || mknod -m 0660 /dev/kmsg c 1 11
+	[[ -h /dev/core ]]    || ln -sf /proc/kcore /dev/core
+	[[ -h /dev/fd ]]      || ln -sf /proc/self/fd /dev/fd
+	[[ -h /dev/stdin ]]   || ln -sf /proc/self/fd/0 /dev/stdin
+	[[ -h /dev/stdout ]]  || ln -sf /proc/self/fd/1 /dev/stdout
+	[[ -h /dev/stderr ]]  || ln -sf /proc/self/fd/2 /dev/stderr
+}
+
+function si_kmods() {
+	local _x
+	for _x in "${KMODS[@]}"; do
+		[[ ${_x:0:1} != '!' ]] && modprobe -b "$_x"
+	done
+}
+
+function si_udev() {
+	local _tmp _udevd=/lib/udev/udevd
+
+	read _tmp </proc/sys/kernel/hotplug
+	if [[ -n "$_tmp" ]]; then
+		echo '' >/proc/sys/kernel/hotplug
+		echo "leave hotplug helper empty when compiling your kernel"
+	fi
+
+	[[ -x $_udevd ]] || _udevd=udevd
+	$_udevd --daemon
+
+	# Any udev rules that explicitly or implicity expect stuff from /usr,
+	# will more or less silently fail after initial trigger; if we detect
+	# that /usr is mountable and not mounted at this point, we set the flag
+	# for later re-trigger
+	# Another potential issue is that heavier stuff from [custom] rules
+	# might want rw access to some directories
+	# well, it's 20[1-9][0-9] - use decent initramfs ;)
+
+	if [[ -n "$(findmnt -r -s -n --target /usr -o SOURCE)" ]]; then
+		if ismnt /usr; then
+			unset rcsi_udev_retrigger
+		else
+			rcsi_udev_retrigger=yes
+		fi
+	fi
+
+	echo "udev coldplug initiated (action=add)"
+	udevadm trigger --type=subsystems --action=add
+	udevadm trigger --type=devices --action=add
+}
+
+
+function si_fsck() {
+	[[ -f /fastboot ]] && return 0
+
+	local _ret _line _msg="\
+********************************************************************************
+*                          FILESYSTEM CHECK FAILED                             *
+*                                                                              *
+* Please repair manually and exit the shell. The system will reboot            *
+* automatically after that.                                                    *
+*                                                                              *
+* Depending on the method you used for the booting (with or without initramfs, *
+* if with - how it is configured), root and possibly other filesystems (/usr   *
+* is pretty typical) might be mounted, (ro) or (rw). Type findmnt to get quick *
+* overview of the present mounts.                                              *
+*                                                                              *
+* To remount someting (rw), execute mount -n -o remount,rw <mountpoint>        *
+*                                                                              *
+********************************************************************************"
+
+	# not a comprehensive list by any means, but solid enough for this stage;
+	# xfs and btrfs are not meant to be auto checked (fsck.xfs is a wrapper
+	# returning 0, btrfs has nothing for -a/-p)
+	local FSCKNO='!opts=_netdev,!xfs,!btrfs,!tmpfs,!ramfs,!devtmpfs,!devpts,!sysfs,!usbfs,!rootfs'
+	# no whitespace between -C and fd !
+	local FSCK="-A -T -M -C0" FSCKSUB='-p'
+
+	# check if / was perhaphs already checked during early boot
+	if [[ -f /dev/.initramfs/root-fsck || -f /run/initramfs/root-fsck ]]; then
+		FSCK+=" -R"
+	else
+		mount -n -o remount,ro /
+	fi
+
+if false; then
+# code removed, this won't work expectedly - e.g. e2fsck will bail out on
+# anythign mounted, (ro) or (rw), unless it's / ... weird
+#
+	if [[ $FSCK_MOUNTED = no ]]; then
+		FSCK+=" -M"
+	else
+		# e2fsck will bail out either way on anything not /, (ro) or (rw)
+		# hmmmm ....
+		ismnt /usr && mount -n -o remount,ro /usr
+	fi
+fi
+
+	[[ -f /forcefsck ]] && FSCKSUB+=" -f"
+
+	echo "fsck starting ...:"
+	echo "  'fsck -t <lots of stuff> ${FSCK# } -- ${FSCKSUB# }'"
+	fsck -t $FSCKNO $FSCK -- $FSCKSUB &>/dev/console <dev/console; _ret=$?
+	echo "+ fsck returned: $_ret"
+	if (( $_ret > 1 )); then
+		emerg_shell "$_msg"
+		echo "automatic reboot in progress..."
+		return 1
+	fi
+	return 0
+}
+
+function si_mount_local() {
+	local _x _opts
+	# remount, mount all local FSes, rebuild mtab
+	echo "mounting local filesystems and swaps ..."
+
+	# remount all mounted filesystems found in fstab, enforcing fstab's
+	# options; that includes both / and other stuff - potentially
+	# premounted by initramfs
+	# also force / to (rw), though this is mostly ornament
+	while read _x; do
+		[[ $_x = / ]] && _opts=rw, || unset _opts
+		ismnt "${_x// /\040}" && mount -n -o ${_opts}remount "$_x"
+	done < <(findmnt -r -s -n -v -o TARGET)
+
+	# rebuild mtab, if it's not a symlink
+	rm -f /etc/mtab?*
+	if [[ ! -h /etc/mtab ]]; then
+		rm -f /etc/mtab
+		shcat </proc/mounts >|/etc/mtab
+	fi
+
+	mount -a -O no_netdev
+	swapon -a
+
+	echo "+ mounting local filesystems and swaps: done"
+}
+
+function si_udev_retry() {
+	# retrigger events with default 'change' hope that /usr needing stuff
+	# will get everything right this time
+	echo "udev retry (presumably with /usr) initiated (action=change)"
+	udevadm trigger --type=subsystems
+	udevadm trigger --type=devices
+}
+
+function __si_console() {
+	local _mode _tseq _stty _tmp _term
+
+	if [[ CONMODE = ascii ]]; then
+		echo 'virtual consoles: setting to ascii ...'
+		_tseq='\e%@'; _mode='-a'; _stty='-iutf8'
+	else
+		echo 'virtual consoles: setting to utf-8 ...'
+		_tseq='\e%G'; _mode='-u'; _stty='iutf8'; unset CHRMAP
+	fi
+
+	# eval to force word splitting, so loadkeys don't complain
+	#eval _term=\'$(compgen -G "/dev/tty[1-9]*")\'
+	#no need for eval until kbd is fixed
+	#eval _term=\'$(compgen -W "/dev/tty{1..${CONCNT:-6}}")\'
+	_term=$(compgen -W "/dev/tty{1..${CONCNT:-6}}")
+	for _tmp in $_term; do
+                kbd_mode $_mode -C $_tmp
+		echo -ne $_tseq >$_tmp
+		stty $_stty -F $_tmp
+		loadkeys -C "$_tmp" "$KEYMAP" 1>/dev/null
+		# the only thing we don't set if undefined
+		[[ -n $FONT ]] && setfont "$FONT" \
+			${UNIMAP:+-u "$UNIMAP"} ${CHRMAP:+-m "$CHRMAP"} -C $_tmp
+	done
+	# tricky whitespace hating bastard
+	# note lack of $_mode below - we earlier run kbd_mode, which lets
+	# loadkeys selfadjust properly
+	# moved to the loop above due to bug in 1.15.3
+	#loadkeys -C "$_term" "$KEYMAP" 1>/dev/null
+	echo "+ virtual consoles: done"
+}
+
+function __si_seed() {
+	local   _size _seed=/var/lib/urandom/seed \
+		_kern=/proc/sys/kernel/random/poolsize
+	echo "random seed: reloading ..."
+	if [[ -r $_seed ]]; then
+		cat $_seed >/dev/urandom
+	else
+		echo "random seed: not found, recreating ..."
+		mkdir -p -m 0755 ${_seed%/*}
+		touch $_seed
+		chmod 0600 $_seed
+		[[ -r $_kern ]] && read _size <$_kern || _size=4096
+		dd if=/dev/urandom of=$_seed count=1 bs=$(( _size / 8 )) 2>/dev/null
+	fi
+	echo "+ random seed: done"
+}
+
+function si_std() {
+	echo "essential sysinit late tasks ..."
+
+	(:
+	__si_console &
+	__si_seed &
+
+	echo "  updating shared library links"
+	ldconfig &
+
+	echo "  clearing leftover files"
+	{ :>/var/run/utmp
+	rm -rf /forcefsck /fastboot /etc/nologin /etc/shutdownpid
+	cd /var/run && find . -name "*.pid" -delete
+	cd /var/lock && find . ! -type d -delete
+	cd /tmp && find . ! -name . -delete
+	mkdir -m 1777 -p /tmp/.{ICE,X11}-unix; } &
+
+	echo "  setting kernel variables"
+	sysctl -p &>/dev/null &
+
+	echo "  setting terminal blank/poweroff timers"
+	setterm -term linux -blank $TERM_BLANK \
+		-powersave powerdown -powerdown $TERM_POWER \
+		>/dev/console </dev/console &
+
+	echo "  setting hostname to: \"$HOSTNAME\""
+	hostname "$HOSTNAME" &
+
+	if [[ ! -r /usr/share/zoneinfo/$TIMEZONE ]]; then
+		echo "  TIMEZONE='$TIMEZONE' is invalid, falling back to UTC"
+		TIMEZONE=UTC
+	fi
+
+	echo "  updating timezone to: \"$TIMEZONE\""
+	{ rm -f /etc/localtime
+	cp -f "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime ; } &
+
+	if [[ $HWCLKREAD = yes ]]; then
+		echo "  setting system time from hardware clock"
+		hwclock --$HWCLKMODE --hctosys &
+	fi
+
+	# wait only for our processes
+	wait )
+	echo "+ essential sysinit late tasks: done"
+}

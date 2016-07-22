@@ -1,0 +1,37 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+# Tiny Kmgs LogD
+#
+# /dev/kmsg must exist
+
+# arguments:
+# $1 - old|new
+# $2 - facility #
+# $3 - level #
+# $4 - log prefix
+# $5 - mesg pipe
+# $6 - done pipe
+# $7 - done tag
+
+trap - 1 2 3 14 15
+exec 0<>$5 1>/dev/kmsg 2>/dev/null
+cd /
+
+declare _line _pre _tag
+
+if [[ $1 = old ]]; then
+	_pre="<$3>"
+else
+	_pre="<$(( $2 << 3 + $3 ))>"
+fi
+_tag="$4: "
+IFS=''
+
+while read -r _line; do
+	[[ $_line = "$7" ]] && break
+	echo "$_pre$_tag$_line"
+done
+
+# writer *must* block here, so no <>
+echo done >$6

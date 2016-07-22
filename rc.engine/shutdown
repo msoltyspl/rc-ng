@@ -1,0 +1,51 @@
+#!/bin/bash
+# vim: ts=8 sw=8 sts=8 noet ft=sh fo=crq
+#
+
+type -p rc_init || . /etc/rc.engine/all
+
+function __sd_seed() {
+	local   _size _seed=/var/lib/urandom/seed \
+		_kern=/proc/sys/kernel/random/poolsize
+
+	echo '  saving random seed ...'
+
+	if [[ ! -w $_seed ]]; then
+		mkdir -p -m 0755 ${_seed%/*}
+		touch $_seed
+		chmod 0600 $_seed
+	fi
+
+	[[ -r $_kern ]] && read _size <$_kern || _size=4096
+	dd if=/dev/urandom of=$_seed count=1 bs=$(( _size / 8 )) 2>/dev/null
+}
+
+function sd_std() {
+	local _hwm
+
+	echo "essential pre-detach tasks ..."
+
+	(:
+	__sd_seed &
+
+	if [[ ! -r /usr/share/zoneinfo/$TIMEZONE ]]; then
+		echo "  TIMEZONE='$TIMEZONE' is invalid, falling back to UTC"
+		TIMEZONE=UTC
+	fi
+	echo "  updating timezone to: \"$TIMEZONE\""
+	{ rm -f /etc/localtime
+	cp -f "/usr/share/zoneinfo/$TIMEZONE" /etc/localtime; } &
+
+	if [[ $HWCLKWRITE = yes ]]; then
+		echo 'saving system time to hardware clock'
+		hwclock --$HWCLKMODE --systohc &
+	fi
+
+	echo '  writing wtmp'
+	halt -w &
+
+	# wait for the pids
+	wait )
+
+	echo "+ essential pre-detach tasks: done"
+}
